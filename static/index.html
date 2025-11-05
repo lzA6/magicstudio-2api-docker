@@ -1,0 +1,59 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>MagicStudio-2API 测试面板</title>
+    <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+    <div class="container">
+        <div class="sidebar">
+            <div class="header">
+                <h2>MagicStudio-2API</h2>
+                <p>v1.0 - 并发代理版</p>
+            </div>
+
+            <div class="form-group">
+                <label for="api-key">API Key</label>
+                <input type="password" id="api-key" placeholder="请输入您的 API Key" value="1">
+            </div>
+
+            <div class="form-group">
+                <label for="model-select">模型 (Model)</label>
+                <select id="model-select"></select>
+            </div>
+
+            <div class="form-group">
+                <label for="prompt-input">提示词 (Prompt)</label>
+                <textarea id="prompt-input" rows="8" placeholder="输入您的图像描述..."></textarea>
+            </div>
+
+            <div class="form-group slider-group">
+                <div class="slider-label">
+                    <label for="count-slider">生成数量 (Count)</label>
+                    <span id="count-value">1</span>
+                </div>
+                <input type="range" id="count-slider" min="1" max="8" step="1" value="1">
+                <small>一次生成多张图片会并发请求，请耐心等待。</small>
+            </div>
+
+            <button id="generate-btn">
+                <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" fill="currentColor" class="bi bi-magic" viewBox="0 0 16 16"><path d="M9.5 2.672a.5.5 0 1 0 1 0V.843a.5.5 0 0 0-1 0v1.829Zm4.5.035A.5.5 0 0 0 13.293 2L12 3.293a.5.5 0 1 0 .707.707L14 2.707a.5.5 0 0 0 0-.707ZM7.293 4L8 3.293a.5.5 0 1 0-.707-.707L6.586 3.293a.5.5 0 1 0 .707.707ZM5 6.293a.5.5 0 1 0-.707-.707L3.586 6.293a.5.5 0 1 0 .707.707L5 6.293Zm6.707.707a.5.5 0 1 0-.707-.707L10.293 7a.5.5 0 1 0 .707.707l.707-.707ZM1.5 10.328a.5.5 0 0 0 1 0V8.5a.5.5 0 0 0-1 0v1.828Zm4.5-.035a.5.5 0 1 0-1 0V12a.5.5 0 0 0 1 0V10.293ZM10 15a1 1 0 1 1 0-2 1 1 0 0 1 0 2Z"/></svg>
+                <span>生成图像</span>
+            </button>
+        </div>
+        <div class="main-content">
+            <div id="result-panel">
+                <div id="placeholder" class="placeholder">
+                    <p>请在左侧配置参数并开始生成</p>
+                </div>
+                <div id="spinner" class="spinner hidden"></div>
+                <div id="error-message" class="error hidden"></div>
+                <div id="image-grid"></div>
+            </div>
+        </div>
+    </div>
+    <script src="/static/script.js"></script>
+</body>
+</html>
