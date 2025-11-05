@@ -1,0 +1,933 @@
+项目 'magicstudio-2api' 的结构树:
+📂 magicstudio-2api/
+    📄 .env
+    📄 .env.example
+    📄 Dockerfile
+    📄 docker-compose.yml
+    📄 main.py
+    📄 nginx.conf
+    📄 requirements.txt
+    📂 app/
+        📂 core/
+            📄 __init__.py
+            📄 config.py
+        📂 providers/
+            📄 __init__.py
+            📄 base_provider.py
+            📄 magicstudio_provider.py
+        📂 utils/
+            📄 sse_utils.py
+    📂 static/
+        📄 index.html
+        📄 script.js
+        📄 style.css
+================================================================================
+
+--- 文件路径: .env ---
+
+# ====================================================================
+# magicstudio-2api 配置文件模板
+# ====================================================================
+#
+# 请将此文件重命名为 ".env" 并填入您的配置。
+#
+
+# --- 核心安全配置 (必须设置) ---
+# 用于保护您 API 服务的访问密钥。
+API_MASTER_KEY=1
+
+# --- 部署配置 (可选) ---
+# Nginx 对外暴露的端口
+NGINX_PORT=8088
+
+
+--- 文件路径: .env.example ---
+
+# ====================================================================
+# magicstudio-2api 配置文件模板
+# ====================================================================
+#
+# 请将此文件重命名为 ".env" 并填入您的配置。
+#
+
+# --- 核心安全配置 (必须设置) ---
+# 用于保护您 API 服务的访问密钥。
+API_MASTER_KEY=sk-magicstudio-2api-default-key-please-change-me
+
+# --- 部署配置 (可选) ---
+# Nginx 对外暴露的端口
+NGINX_PORT=8088
+
+
+--- 文件路径: Dockerfile ---
+
+# ====================================================================
+# Dockerfile for magicstudio-2api (v1.0 - Concurrent Proxy Edition)
+# ====================================================================
+
+FROM python:3.10-slim
+
+# 设置环境变量
+ENV PYTHONDONTWRITEBYTECODE=1
+ENV PYTHONUNBUFFERED=1
+WORKDIR /app
+
+# 安装 Python 依赖
+COPY requirements.txt .
+RUN pip install --no-cache-dir --upgrade pip && \
+    pip install --no-cache-dir -r requirements.txt
+
+# 复制应用代码
+COPY . .
+
+# 创建并切换到非 root 用户
+RUN useradd --create-home appuser && \
+    chown -R appuser:appuser /app
+USER appuser
+
+# 暴露端口并启动
+EXPOSE 8000
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "1"]
+
+
+--- 文件路径: docker-compose.yml ---
+
+services:
+  nginx:
+    image: nginx:latest
+    container_name: magicstudio-2api-nginx
+    restart: always
+    ports:
+      - "${NGINX_PORT:-8088}:80"
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+    depends_on:
+      - app
+    networks:
+      - magicstudio-net
+
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: magicstudio-2api-app
+    restart: unless-stopped
+    env_file:
+      - .env
+    networks:
+      - magicstudio-net
+
+networks:
+  magicstudio-net:
+    driver: bridge
+
+
+--- 文件路径: main.py ---
+
+import logging
+import time
+import uuid
+from contextlib import asynccontextmanager
+from typing import Optional
+
+from fastapi import FastAPI, Request, HTTPException, Depends, Header
+from fastapi.responses import JSONResponse, HTMLResponse
+from fastapi.staticfiles import StaticFiles
+
+from app.core.config import settings
+from app.providers.magicstudio_provider import MagicStudioProvider
+
+# --- 日志配置 ---
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+
+# --- 全局 Provider 实例 ---
+provider = MagicStudioProvider()
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    logger.info(f"应用启动中... {settings.APP_NAME} v{settings.APP_VERSION}")
+    logger.info("服务已进入 'Concurrent Proxy' 模式。")
+    logger.info(f"API 服务将在 http://localhost:{settings.NGINX_PORT} 上可用")
+    logger.info(f"Web UI 测试界面已启用，请访问 http://localhost:{settings.NGINX_PORT}/")
+    yield
+    logger.info("应用关闭。")
+
+app = FastAPI(
+    title=settings.APP_NAME,
+    version=settings.APP_VERSION,
+    description=settings.DESCRIPTION,
+    lifespan=lifespan
+)
+
+# --- 挂载静态文件目录 ---
+app.mount("/static", StaticFiles(directory="static"), name="static")
+
+# --- 安全依赖 ---
+async def verify_api_key(authorization: Optional[str] = Header(None)):
+    if settings.API_MASTER_KEY and settings.API_MASTER_KEY != "1":
+        if not authorization or "bearer" not in authorization.lower():
+            raise HTTPException(status_code=401, detail="需要 Bearer Token 认证。")
+        token = authorization.split(" ")[-1]
+        if token != settings.API_MASTER_KEY:
+            raise HTTPException(status_code=403, detail="无效的 API Key。")
+
+# --- API 路由 ---
+@app.post("/v1/images/generations", dependencies=[Depends(verify_api_key)])
+async def image_generations(request: Request):
+    try:
+        request_data = await request.json()
+        image_result_dict = await provider.generate_image(request_data)
+        return JSONResponse(content=image_result_dict)
+    except Exception as e:
+        logger.error(f"处理图像生成请求时发生顶层错误: {e}", exc_info=True)
+        if isinstance(e, HTTPException):
+            raise e
+        raise HTTPException(status_code=500, detail=f"内部服务器错误: {str(e)}")
+
+@app.post("/v1/chat/completions", dependencies=[Depends(verify_api_key)])
+async def chat_completions(request: Request):
+    try:
+        request_data = await request.json()
+        
+        messages = request_data.get("messages", [])
+        if not messages:
+            raise HTTPException(status_code=400, detail="请求体中缺少 'messages' 字段。")
+        
+        last_user_message = next((m['content'] for m in reversed(messages) if m.get('role') == 'user'), None)
+        if not last_user_message:
+            raise HTTPException(status_code=400, detail="在 'messages' 中未找到用户消息。")
+
+        model_name = request_data.get("model", settings.DEFAULT_MODEL)
+
+        image_request_data = {
+            "prompt": last_user_message,
+            "model": model_name,
+            "n": 1,
+            "response_format": "b64_json"
+        }
+        
+        logger.info(f"通过聊天接口适配图像生成，使用 prompt: '{last_user_message[:50]}...'")
+        image_result_dict = await provider.generate_image(image_request_data)
+
+        if not image_result_dict.get("data") or not image_result_dict["data"][0].get("b64_json"):
+            raise HTTPException(status_code=502, detail="从上游服务生成图像失败。")
+            
+        b64_json = image_result_dict["data"][0]["b64_json"]
+        
+        response_content = f"![](data:image/png;base64,{b64_json})"
+        
+        chat_response = {
+            "id": f"chatcmpl-{uuid.uuid4()}",
+            "object": "chat.completion",
+            "created": int(time.time()),
+            "model": model_name,
+            "choices": [{
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": response_content,
+                },
+                "finish_reason": "stop",
+            }],
+            "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+        }
+        
+        return JSONResponse(content=chat_response)
+
+    except Exception as e:
+        logger.error(f"处理聊天生成请求时发生顶层错误: {e}", exc_info=True)
+        if isinstance(e, HTTPException):
+            raise e
+        raise HTTPException(status_code=500, detail=f"内部服务器错误: {str(e)}")
+
+@app.get("/v1/models", dependencies=[Depends(verify_api_key)])
+async def list_models():
+    return await provider.get_models()
+
+@app.get("/", response_class=HTMLResponse, include_in_schema=False)
+async def serve_ui():
+    try:
+        with open("static/index.html", "r", encoding="utf-8") as f:
+            return HTMLResponse(content=f.read())
+    except FileNotFoundError:
+        raise HTTPException(status_code=404, detail="UI 文件 (static/index.html) 未找到。")
+
+
+--- 文件路径: nginx.conf ---
+
+worker_processes auto;
+
+events {
+    worker_connections 1024;
+}
+
+http {
+    upstream magicstudio_backend {
+        server app:8000;
+    }
+
+    server {
+        listen 80;
+        server_name localhost;
+
+        client_max_body_size 10M;
+
+        location / {
+            proxy_pass http://magicstudio_backend;
+            proxy_set_header Host $host;
+            proxy_set_header X-Real-IP $remote_addr;
+            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+            proxy_set_header X-Forwarded-Proto $scheme;
+            
+            proxy_buffering off;
+            proxy_cache off;
+            proxy_set_header Connection '';
+            proxy_http_version 1.1;
+            chunked_transfer_encoding off;
+        }
+    }
+}
+
+
+--- 文件路径: requirements.txt ---
+
+fastapi
+uvicorn[standard]
+pydantic-settings
+python-dotenv
+httpx
+loguru
+
+
+--- 文件路径: app\core\__init__.py ---
+
+
+
+--- 文件路径: app\core\config.py ---
+
+from pydantic_settings import BaseSettings, SettingsConfigDict
+from typing import Optional, List
+
+class Settings(BaseSettings):
+    model_config = SettingsConfigDict(
+        env_file=".env",
+        env_file_encoding='utf-8',
+        extra="ignore"
+    )
+
+    APP_NAME: str = "magicstudio-2api"
+    APP_VERSION: str = "1.0.0"
+    DESCRIPTION: str = "一个将 Magic Studio AI Art Generator 转换为兼容 OpenAI 格式 API 的高性能并发代理。"
+
+    API_MASTER_KEY: Optional[str] = None
+    NGINX_PORT: int = 8088
+
+    # 上游请求配置
+    API_REQUEST_TIMEOUT: int = 180
+    UPSTREAM_MAX_RETRIES: int = 3
+    UPSTREAM_RETRY_DELAY: int = 2 # 秒
+
+    # 上游API固定参数
+    UPSTREAM_CLIENT_ID: str = "pSgX7WgjukXCBoYwDM8G8GLnRRkvAoJlqa5eAVvj95o"
+
+    # 模型配置
+    DEFAULT_MODEL: str = "magic-art-generator"
+    KNOWN_MODELS: List[str] = ["magic-art-generator"]
+
+settings = Settings()
+
+
+--- 文件路径: app\providers\__init__.py ---
+
+
+
+--- 文件路径: app\providers\base_provider.py ---
+
+from abc import ABC, abstractmethod
+from typing import Dict, Any
+from fastapi.responses import StreamingResponse, JSONResponse
+
+class BaseProvider(ABC):
+    @abstractmethod
+    async def chat_completion(
+        self,
+        request_data: Dict[str, Any]
+    ) -> StreamingResponse:
+        pass
+
+    @abstractmethod
+    async def get_models(self) -> JSONResponse:
+        pass
+
+
+--- 文件路径: app\providers\magicstudio_provider.py ---
+
+import time
+import logging
+import random
+import asyncio
+import uuid
+import base64
+from typing import Dict, Any, Optional
+
+import httpx
+from fastapi import HTTPException, Response
+
+from app.core.config import settings
+
+logger = logging.getLogger(__name__)
+
+class MagicStudioProvider:
+    BASE_URL = "https://ai-api.magicstudio.com/api/ai-art-generator"
+
+    def __init__(self):
+        # [修正] 移除不被支持的 'backoff_factor' 参数，以符合 httpx API
+        retries = settings.UPSTREAM_MAX_RETRIES
+        transport = httpx.AsyncHTTPTransport(retries=retries)
+        self.client = httpx.AsyncClient(
+            timeout=settings.API_REQUEST_TIMEOUT,
+            transport=transport
+        )
+
+    def _prepare_headers(self) -> Dict[str, str]:
+        return {
+            "Accept": "application/json, text/plain, */*",
+            "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+            "Origin": "https://magicstudio.com",
+            "Referer": "https://magicstudio.com/",
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36",
+        }
+
+    async def _send_single_request(self, prompt: str) -> str:
+        """
+        发送单个图像生成请求并返回Base64编码的图像数据。
+        """
+        headers = self._prepare_headers()
+        data = {
+            "prompt": prompt,
+            "output_format": "bytes",
+            "user_profile_id": "null",
+            "anonymous_user_id": str(uuid.uuid4()),
+            "request_timestamp": str(time.time()),
+            "user_is_subscribed": "false",
+            "client_id": settings.UPSTREAM_CLIENT_ID,
+        }
+
+        try:
+            response = await self.client.post(self.BASE_URL, headers=headers, data=data)
+            response.raise_for_status()
+
+            content_type = response.headers.get("content-type")
+            if "image" not in content_type:
+                error_text = response.text
+                logger.error(f"上游未返回图像，而是返回: {content_type}, 内容: {error_text[:200]}")
+                raise ValueError(f"Upstream API did not return an image. Response: {error_text}")
+
+            image_bytes = await response.aread()
+            return base64.b64encode(image_bytes).decode('utf-8')
+
+        except httpx.HTTPStatusError as e:
+            logger.error(f"请求上游失败，状态码: {e.response.status_code}, 响应: {e.response.text}")
+            raise HTTPException(status_code=502, detail=f"Upstream service error: {e.response.status_code}")
+        except Exception as e:
+            logger.error(f"发送单个请求时发生未知错误: {e}", exc_info=True)
+            raise
+
+    async def generate_image(self, request_data: Dict[str, Any]) -> Dict[str, Any]:
+        prompt = request_data.get("prompt")
+        if not prompt:
+            raise HTTPException(status_code=400, detail="参数 'prompt' 不能为空。")
+
+        num_images = request_data.get("n", 1)
+        response_format = request_data.get("response_format", "b64_json")
+
+        if response_format != "b64_json":
+            raise HTTPException(status_code=400, detail="仅支持 'b64_json' 响应格式。")
+
+        tasks = [self._send_single_request(prompt) for _ in range(num_images)]
+        logger.info(f"准备向上游并发发送 {num_images} 个图像生成请求...")
+
+        try:
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+            
+            successful_results = []
+            for res in results:
+                if isinstance(res, Exception):
+                    logger.error(f"一个并发任务失败: {res}")
+                else:
+                    successful_results.append(res)
+            
+            if not successful_results:
+                raise HTTPException(status_code=502, detail="所有上游图像生成任务均失败。")
+
+            response_data = {
+                "created": int(time.time()),
+                "data": [{"b64_json": b64_str} for b64_str in successful_results]
+            }
+            return response_data
+
+        except Exception as e:
+            logger.error(f"处理并发请求时发生严重错误: {e}", exc_info=True)
+            raise HTTPException(status_code=500, detail=f"处理并发图像生成时出错: {str(e)}")
+
+    async def get_models(self) -> Dict[str, Any]:
+        return {
+            "object": "list",
+            "data": [
+                {"id": name, "object": "model", "created": int(time.time()), "owned_by": "lzA6"}
+                for name in settings.KNOWN_MODELS
+            ]
+        }
+
+
+--- 文件路径: app\utils\sse_utils.py ---
+
+import json
+import time
+from typing import Dict, Any, Optional
+
+DONE_CHUNK = b"data: [DONE]\n\n"
+
+def create_sse_data(data: Dict[str, Any]) -> bytes:
+    """将字典数据格式化为 SSE 事件字符串。"""
+    return f"data: {json.dumps(data, ensure_ascii=False)}\n\n".encode('utf-8')
+
+def create_chat_completion_chunk(
+    request_id: str,
+    model: str,
+    content: str,
+    finish_reason: Optional[str] = None
+) -> Dict[str, Any]:
+    """创建一个与 OpenAI 兼容的聊天补全流式块。"""
+    return {
+        "id": request_id,
+        "object": "chat.completion.chunk",
+        "created": int(time.time()),
+        "model": model,
+        "choices": [
+            {
+                "index": 0,
+                "delta": {"content": content},
+                "finish_reason": finish_reason
+            }
+        ]
+    }
+
+
+--- 文件路径: static\index.html ---
+
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>MagicStudio-2API 测试面板</title>
+    <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+    <div class="container">
+        <div class="sidebar">
+            <div class="header">
+                <h2>MagicStudio-2API</h2>
+                <p>v1.0 - 并发代理版</p>
+            </div>
+
+            <div class="form-group">
+                <label for="api-key">API Key</label>
+                <input type="password" id="api-key" placeholder="请输入您的 API Key" value="1">
+            </div>
+
+            <div class="form-group">
+                <label for="model-select">模型 (Model)</label>
+                <select id="model-select"></select>
+            </div>
+
+            <div class="form-group">
+                <label for="prompt-input">提示词 (Prompt)</label>
+                <textarea id="prompt-input" rows="8" placeholder="输入您的图像描述..."></textarea>
+            </div>
+
+            <div class="form-group slider-group">
+                <div class="slider-label">
+                    <label for="count-slider">生成数量 (Count)</label>
+                    <span id="count-value">1</span>
+                </div>
+                <input type="range" id="count-slider" min="1" max="8" step="1" value="1">
+                <small>一次生成多张图片会并发请求，请耐心等待。</small>
+            </div>
+
+            <button id="generate-btn">
+                <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" fill="currentColor" class="bi bi-magic" viewBox="0 0 16 16"><path d="M9.5 2.672a.5.5 0 1 0 1 0V.843a.5.5 0 0 0-1 0v1.829Zm4.5.035A.5.5 0 0 0 13.293 2L12 3.293a.5.5 0 1 0 .707.707L14 2.707a.5.5 0 0 0 0-.707ZM7.293 4L8 3.293a.5.5 0 1 0-.707-.707L6.586 3.293a.5.5 0 1 0 .707.707ZM5 6.293a.5.5 0 1 0-.707-.707L3.586 6.293a.5.5 0 1 0 .707.707L5 6.293Zm6.707.707a.5.5 0 1 0-.707-.707L10.293 7a.5.5 0 1 0 .707.707l.707-.707ZM1.5 10.328a.5.5 0 0 0 1 0V8.5a.5.5 0 0 0-1 0v1.828Zm4.5-.035a.5.5 0 1 0-1 0V12a.5.5 0 0 0 1 0V10.293ZM10 15a1 1 0 1 1 0-2 1 1 0 0 1 0 2Z"/></svg>
+                <span>生成图像</span>
+            </button>
+        </div>
+        <div class="main-content">
+            <div id="result-panel">
+                <div id="placeholder" class="placeholder">
+                    <p>请在左侧配置参数并开始生成</p>
+                </div>
+                <div id="spinner" class="spinner hidden"></div>
+                <div id="error-message" class="error hidden"></div>
+                <div id="image-grid"></div>
+            </div>
+        </div>
+    </div>
+    <script src="/static/script.js"></script>
+</body>
+</html>
+
+--- 文件路径: static\script.js ---
+
+document.addEventListener('DOMContentLoaded', () => {
+    // DOM Elements
+    const apiKeyInput = document.getElementById('api-key');
+    const modelSelect = document.getElementById('model-select');
+    const promptInput = document.getElementById('prompt-input');
+    const generateBtn = document.getElementById('generate-btn');
+    const countSlider = document.getElementById('count-slider');
+    const countValue = document.getElementById('count-value');
+    const imageGrid = document.getElementById('image-grid');
+    const spinner = document.getElementById('spinner');
+    const errorMessage = document.getElementById('error-message');
+    const placeholder = document.getElementById('placeholder');
+
+    async function populateModels() {
+        modelSelect.innerHTML = '';
+        modelSelect.disabled = true;
+        generateBtn.disabled = true;
+        hideError();
+
+        const apiKey = apiKeyInput.value.trim();
+        if (!apiKey) {
+            const placeholderOption = document.createElement('option');
+            placeholderOption.textContent = "请输入API Key以加载模型";
+            modelSelect.appendChild(placeholderOption);
+            return;
+        }
+
+        const loadingOption = document.createElement('option');
+        loadingOption.textContent = "正在加载模型...";
+        modelSelect.appendChild(loadingOption);
+
+        try {
+            const response = await fetch('/v1/models', {
+                headers: { 'Authorization': `Bearer ${apiKey}` }
+            });
+            const result = await response.json();
+            if (!response.ok) {
+                throw new Error(result.detail || '获取模型列表失败。');
+            }
+            
+            modelSelect.innerHTML = '';
+            result.data.forEach(model => {
+                const option = document.createElement('option');
+                option.value = model.id;
+                option.textContent = model.id;
+                modelSelect.appendChild(option);
+            });
+            
+            modelSelect.disabled = false;
+            generateBtn.disabled = false;
+
+        } catch (error) {
+            showError(`模型加载失败: ${error.message}. 请检查您的 API Key.`);
+            modelSelect.innerHTML = '';
+            const errorOption = document.createElement('option');
+            errorOption.textContent = "加载失败，请检查API Key";
+            modelSelect.appendChild(errorOption);
+        }
+    }
+
+    async function handleGenerate() {
+        const apiKey = apiKeyInput.value.trim();
+        const prompt = promptInput.value.trim();
+        const selectedModel = modelSelect.value;
+
+        if (!apiKey || !prompt) {
+            showError("请确保 API Key 和提示词都已填写。");
+            return;
+        }
+        if (!selectedModel || modelSelect.disabled) {
+            showError("模型未成功加载或未选择，请检查您的 API Key。");
+            return;
+        }
+
+        setLoading(true);
+
+        const payload = {
+            model: selectedModel,
+            prompt: prompt,
+            n: parseInt(countSlider.value, 10),
+            response_format: "b64_json"
+        };
+
+        try {
+            const response = await fetch('/v1/images/generations', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                    'Authorization': `Bearer ${apiKey}`
+                },
+                body: JSON.stringify(payload)
+            });
+
+            const result = await response.json();
+            if (!response.ok) {
+                throw new Error(result.detail || '生成失败，未知错误。');
+            }
+
+            if (result.data && result.data.length > 0) {
+                displayImages(result.data);
+            } else {
+                throw new Error('API 返回了成功状态，但没有图片数据。');
+            }
+        } catch (error) {
+            showError(error.message);
+        } finally {
+            setLoading(false);
+        }
+    }
+
+    function displayImages(data) {
+        imageGrid.innerHTML = '';
+        data.forEach(item => {
+            if (item.b64_json) {
+                const imgContainer = document.createElement('div');
+                imgContainer.className = 'image-container';
+                const img = document.createElement('img');
+                img.src = `data:image/png;base64,${item.b64_json}`;
+                img.alt = 'Generated Image';
+                imgContainer.appendChild(img);
+                imageGrid.appendChild(imgContainer);
+            }
+        });
+    }
+
+    function setLoading(isLoading) {
+        generateBtn.disabled = isLoading;
+        spinner.classList.toggle('hidden', !isLoading);
+        placeholder.classList.toggle('hidden', isLoading || imageGrid.children.length > 0);
+        if (isLoading) {
+            imageGrid.innerHTML = '';
+            hideError();
+        }
+    }
+
+    function showError(message) {
+        errorMessage.textContent = message;
+        errorMessage.classList.remove('hidden');
+        imageGrid.innerHTML = '';
+        placeholder.classList.add('hidden');
+    }
+
+    function hideError() {
+        errorMessage.classList.add('hidden');
+    }
+
+    countSlider.addEventListener('input', () => countValue.textContent = countSlider.value);
+    generateBtn.addEventListener('click', handleGenerate);
+    apiKeyInput.addEventListener('change', populateModels);
+
+    populateModels();
+});
+
+
+--- 文件路径: static\style.css ---
+
+:root {
+    --bg-color: #f0f2f5;
+    --sidebar-bg: #ffffff;
+    --main-bg: #f7f7f8;
+    --border-color: #e5e7eb;
+    --text-color: #111827;
+    --text-secondary: #6b7280;
+    --primary-color: #4f46e5;
+    --primary-hover: #4338ca;
+    --input-bg: #f9fafb;
+}
+
+* { box-sizing: border-box; }
+
+body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+    margin: 0;
+    background-color: var(--bg-color);
+    color: var(--text-color);
+    font-size: 14px;
+    display: flex;
+    height: 100vh;
+    overflow: hidden;
+}
+
+.container {
+    display: flex;
+    width: 100%;
+    height: 100%;
+}
+
+.sidebar {
+    width: 350px;
+    flex-shrink: 0;
+    background-color: var(--sidebar-bg);
+    border-right: 1px solid var(--border-color);
+    padding: 24px;
+    display: flex;
+    flex-direction: column;
+    overflow-y: auto;
+}
+
+.header {
+    padding-bottom: 16px;
+    margin-bottom: 24px;
+    border-bottom: 1px solid var(--border-color);
+}
+.header h2 { margin: 0; }
+.header p { margin: 4px 0 0; color: var(--text-secondary); }
+
+.main-content {
+    flex-grow: 1;
+    background-color: var(--main-bg);
+    padding: 24px;
+    overflow-y: auto;
+}
+
+#result-panel {
+    width: 100%;
+    height: 100%;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+}
+
+.form-group { margin-bottom: 20px; }
+label { display: block; font-weight: 500; margin-bottom: 8px; }
+
+input[type="password"], textarea, select {
+    width: 100%;
+    padding: 12px 14px;
+    border: 1px solid var(--border-color);
+    border-radius: 6px;
+    font-size: 16px;
+    background-color: var(--input-bg);
+    transition: border-color 0.2s;
+}
+textarea { resize: vertical; }
+input:focus, textarea:focus, select:focus {
+    outline: none;
+    border-color: var(--primary-color);
+    box-shadow: 0 0 0 2px rgba(79, 70, 229, 0.2);
+}
+
+.slider-group .slider-label {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+}
+.slider-group .slider-label span {
+    font-weight: 600;
+    color: var(--primary-color);
+}
+.slider-group small {
+    display: block;
+    margin-top: 6px;
+    font-size: 12px;
+    color: var(--text-secondary);
+}
+
+input[type="range"] {
+    -webkit-appearance: none;
+    width: 100%;
+    height: 6px;
+    background: #ddd;
+    border-radius: 5px;
+    outline: none;
+    margin-top: 8px;
+}
+input[type="range"]::-webkit-slider-thumb {
+    -webkit-appearance: none;
+    appearance: none;
+    width: 18px;
+    height: 18px;
+    background: var(--primary-color);
+    cursor: pointer;
+    border-radius: 50%;
+}
+input[type="range"]::-moz-range-thumb {
+    width: 18px;
+    height: 18px;
+    background: var(--primary-color);
+    cursor: pointer;
+    border-radius: 50%;
+}
+
+#generate-btn {
+    width: 100%;
+    padding: 12px;
+    background-color: var(--primary-color);
+    color: white;
+    border: none;
+    border-radius: 6px;
+    font-size: 16px;
+    font-weight: 500;
+    cursor: pointer;
+    transition: background-color 0.2s;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 8px;
+    margin-top: auto;
+}
+#generate-btn:hover { background-color: var(--primary-hover); }
+#generate-btn:disabled { background-color: #9ca3af; cursor: not-allowed; }
+
+.placeholder {
+    text-align: center;
+    color: var(--text-secondary);
+}
+
+#image-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(256px, 1fr));
+    gap: 16px;
+    width: 100%;
+}
+.image-container {
+    position: relative;
+    overflow: hidden;
+    border-radius: 8px;
+    box-shadow: 0 4px 12px rgba(0,0,0,0.1);
+    background-color: #fff;
+}
+.image-container img {
+    width: 100%;
+    height: 100%;
+    object-fit: cover;
+    display: block;
+}
+
+.hidden { display: none; }
+
+.spinner {
+    border: 5px solid rgba(0, 0, 0, 0.1);
+    width: 50px;
+    height: 50px;
+    border-radius: 50%;
+    border-left-color: var(--primary-color);
+    animation: spin 1s ease infinite;
+}
+@keyframes spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }
+
+.error {
+    color: #b91c1c;
+    background-color: #fee2e2;
+    border: 1px solid #fca5a5;
+    padding: 15px;
+    border-radius: 6px;
+    text-align: center;
+    max-width: 600px;
+}
+
+
+
